@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .dynamic_conv import Dynamic_conv2d
+from .BottleneckTransformers import ResNet50
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = 3 if kernel_size ==7 else 1
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 1, kernel_size, padding=padding, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.conv(torch.max(x, 1, keepdim=True)[0])
+
+class DFIMBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.dyn_conv = nn.Sequential(
+            Dynamic_conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.GELU(),
+            Dynamic_conv2d(channels, channels, 1),
+            nn.GELU()
+        )
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return self.sa(self.dyn_conv[0](x) + self.dyn_conv[2](self.dyn_conv[1](self.dyn_conv[0](x))))
+
+class ResPath(nn.Module):
+    def __init__(self, num_classes=1):
+        super().__init__()
+        self.processing = nn.ModuleDict({
+            'd4': nn.Sequential(
+                Dynamic_conv2d(1024, 256, 3, padding=1),
+                nn.GELU(),
+                nn.Upsample(scale_factor=8, mode='bilinear')
+            ),
+            'd3': nn.Sequential(
+                Dynamic_conv2d(512, 256, 3, padding=1),
+                nn.GELU(),
+                nn.Upsample(scale_factor=4, mode='bilinear')
+            ),
+            'd2': nn.Upsample(scale_factor=2, mode='bilinear')
+        })
+        
+        self.fusion = nn.Sequential(
+            Dynamic_conv2d(1024, 256, 3, padding=1),
+            nn.GELU(),
+            Dynamic_conv2d(256, num_classes, 3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, *features):
+        processed = [self.processing[f'd{i+2}'](feat) for i, feat in enumerate(features[:3])]
+        return self.fusion(torch.cat([*processed, features[-1]], 1))
+
+class Decoder(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch//4, 1),
+            nn.BatchNorm2d(in_ch//4),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(in_ch//4, in_ch//4, 3, padding=1),
+            nn.BatchNorm2d(in_ch//4),
+            nn.GELU(),
+            nn.Conv2d(in_ch//4, out_ch, 1),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+class DFITNet(nn.Module):
+    def __init__(self, num_classes=9):
+        super().__init__()
+        resnet = ResNet50()
+        self.encoder = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
+            resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
+        )
+        
+        self.dfim_blocks = nn.ModuleList([
+            nn.ModuleList([DFIMBlock(256) for _ in range(6)]),
+            nn.ModuleList([DFIMBlock(512) for _ in range(4)]),
+            nn.ModuleList([DFIMBlock(1024) for _ in range(2)])
+        ])
+        
+        self.decoders = nn.ModuleList([
+            Decoder(2048, 1024), Decoder(1024, 512),
+            Decoder(512, 256), Decoder(256, 256)
+        ])
+        
+        self.res_path = ResPath()
+        self.final = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(256, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, num_classes, 3, padding=1)
+        )
+
+    def process_features(self, features):
+        return [ [block(feat) for block in blocks][-1] 
+                for feat, blocks in zip(features[1:], self.dfim_blocks) ]
+
+    def forward(self, x, isres=False):
+        # Encoder
+        e0 = self.encoder[0:4](x)
+        features = [encoder(e0) for encoder in self.encoder[4:8]]
+        
+        # Feature processing
+        p = self.process_features([e0] + features)
+        
+        # Decoding
+        d = [decoder(feat) + p[i] for i, (decoder, feat) in enumerate(zip(
+            self.decoders, [features[-1]] + features[-2::-1]
+        ))]
+        
+        # Residual pathway
+        res = self.res_path(*d[:4])
+        if isres:
+            res_scales = [F.avg_pool2d(res, 2**i) for i in range(3,-1,-1)]
+            d = [decoder(feat * (1 + scale)) for decoder, feat, scale in zip(
+                self.decoders, [features[-1]] + features[-2::-1], res_scales
+            )]
+        
+        return self.final(d[-1])
