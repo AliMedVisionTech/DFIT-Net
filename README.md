@@ -8,13 +8,9 @@ Our project has benefited from the following resources, and I would like to expr
 * [DAEFormer](https://github.com/xmindflow/DAEFormer)
 * [Swin-Unet](https://github.com/HuCaoFighting/Swin-Unet)
 
-# Citation
 
-@article{ali2025dfit,
-    author    = {Ali, Haider and Xie, Juanying},
-    title     = {DFIT-Net: A novel dynamic feature integration transformer for automatic segmentation of multi-organ structures in medical imaging},
-    journal   = {Displays},
-    year      = {2025},
-    pages     = {103087},
-    publisher = {Elsevier}
-}
+### Citation
+
+If you use this project in your research or work, please cite the following paper:
+
+`@article{ali2025dfit, author = {Ali, Haider and Xie, Juanying}, title = {DFIT-Net: A novel dynamic feature integration transformer for automatic segmentation of multi-organ structures in medical imaging}, journal = {Displays}, year = {2025}, pages = {103087}, publisher = {Elsevier}}`
